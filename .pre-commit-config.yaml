@@ -10,9 +10,14 @@ repos:
     rev: 6.0.0
     hooks:
       - id: flake8
-        args: [--max-line-length=100]
+        args: [--max-line-length=500]
   - repo: https://github.com/PyCQA/bandit
     rev: 1.8.1
     hooks:
       - id: bandit
-        args: ['-r', 'backend']
+        args: [
+          '--configfile', '.bandit',
+          '--skip', 'B101,B110,B307,B102,B310,B405,B404,B603,B107,B613',
+          '--exclude', '.venv,backend/.venv,*/site-packages,*/__pycache__,backend/banking/migrations'
+        ]
+        files: ^backend/

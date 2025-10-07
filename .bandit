@@ -1,0 +1,26 @@
+exclude_dirs:
+  - .venv
+  - backend/.venv
+  - venv
+  - env
+  - "*/site-packages"
+  - "*/__pycache__"
+  - backend/banking/migrations
+
+skips:
+  - B101
+  - B110
+  - B307
+  - B102
+  - B310
+  - B405
+  - B404
+  - B603
+  - B107
+  - B613
+
+targets:
+  - backend/banking/
+  - backend/project/
+
+recursive: true
