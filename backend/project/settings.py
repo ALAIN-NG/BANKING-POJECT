@@ -47,6 +47,7 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
 
     # Apps tierces
+    'rest_framework',
     "corsheaders",                        # pour gérer le CORS (API / frontend)
     "whitenoise.runserver_nostatic",      # fichiers statiques en production
 

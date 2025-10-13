@@ -23,6 +23,8 @@ from django.contrib.auth.models import AbstractUser
 from django.core.exceptions import ValidationError
 from django.db import models, transaction
 from django.utils import timezone
+from django.db.models import JSONField, PositiveIntegerField, DateField, CharField, TextField, BooleanField
+
 
 # -------------------------
 # Constants / Helpers
@@ -383,3 +385,269 @@ class BankCard(models.Model):
 
     def __str__(self):
         return f"**** **** **** {self.last4} ({self.account.account_number})"
+
+
+# -------------------------
+# Loans
+# -------------------------
+class Loan(models.Model):
+    """
+    Représentation d'une demande / contrat de prêt.
+    - amount: principal demandé
+    - term_months: durée en mois
+    - interest_rate: taux annuel en pourcentage (ex: 7.5)
+    - status: draft -> submitted -> approved -> active -> closed -> rejected
+    - payment_schedule: JSON optionnel (amortization schedule)
+    """
+    STATUS_DRAFT = "draft"
+    STATUS_SUBMITTED = "submitted"
+    STATUS_APPROVED = "approved"
+    STATUS_ACTIVE = "active"
+    STATUS_CLOSED = "closed"
+    STATUS_REJECTED = "rejected"
+    STATUS_CHOICES = [
+        (STATUS_DRAFT, "Draft"),
+        (STATUS_SUBMITTED, "Submitted"),
+        (STATUS_APPROVED, "Approved"),
+        (STATUS_ACTIVE, "Active"),
+        (STATUS_CLOSED, "Closed"),
+        (STATUS_REJECTED, "Rejected"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    applicant = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="loans", on_delete=models.CASCADE)
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    amount = models.DecimalField(max_digits=MAX_DIGITS, decimal_places=DECIMAL_PLACES)
+    term_months = PositiveIntegerField(default=12)
+    interest_rate = models.DecimalField(max_digits=5, decimal_places=2, default=Decimal("0.00"))  # percent per year
+    monthly_payment = models.DecimalField(max_digits=MAX_DIGITS, decimal_places=DECIMAL_PLACES, null=True, blank=True)
+    outstanding_amount = models.DecimalField(max_digits=MAX_DIGITS, decimal_places=DECIMAL_PLACES, default=Decimal("0.00"))
+    status = CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_DRAFT)
+    notes = TextField(blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["applicant"]),
+            models.Index(fields=["status"]),
+        ]
+
+    def __str__(self):
+        return f"Loan {self.id} for {self.applicant.email} ({self.status})"
+
+    def submit(self):
+        if self.status != self.STATUS_DRAFT:
+            raise ValidationError("Loan not in draft state")
+        self.status = self.STATUS_SUBMITTED
+        self.submitted_at = timezone.now()
+        self.save()
+
+    def approve(self, by_user=None):
+        # basic approval workflow; in real life add underwriting checks
+        if self.status not in (self.STATUS_SUBMITTED, self.STATUS_DRAFT):
+            raise ValidationError("Loan not submittable/approvable")
+        self.status = self.STATUS_APPROVED
+        self.approved_at = timezone.now()
+        # set outstanding and monthly_payment (simple amortization formula)
+        principal = quantize_amount(Decimal(self.amount))
+        r = Decimal(self.interest_rate) / Decimal("100.0") / Decimal("12.0")  # monthly rate
+        n = int(self.term_months)
+        if r == 0:
+            monthly = (principal / n).quantize(Decimal(f"1.{'0'*DECIMAL_PLACES}"))
+        else:
+            # monthly payment = P * r / (1 - (1+r)^-n)
+            monthly = (principal * r / (1 - (1 + r) ** (-n))).quantize(Decimal(f"1.{'0'*DECIMAL_PLACES}"))
+        self.monthly_payment = monthly
+        self.outstanding_amount = principal
+        self.save()
+        AuditLog.objects.create(user=by_user, action="loan_approved", details=f"Loan {self.id} approved")
+
+    def activate(self, by_user=None):
+        if self.status != self.STATUS_APPROVED:
+            raise ValidationError("Only approved loans can be activated")
+        self.status = self.STATUS_ACTIVE
+        self.save()
+        AuditLog.objects.create(user=by_user, action="loan_activated", details=f"Loan {self.id} activated")
+
+    def register_payment(self, amount: Decimal, by_user=None):
+        """Register a payment towards outstanding_amount."""
+        amount = quantize_amount(Decimal(amount))
+        if amount <= Decimal("0.00"):
+            raise ValidationError("Montant de paiement invalide")
+        if self.status != self.STATUS_ACTIVE:
+            raise ValidationError("Loan not active")
+        # Decrease outstanding
+        self.outstanding_amount = quantize_amount(self.outstanding_amount - amount)
+        if self.outstanding_amount <= Decimal("0.00"):
+            self.outstanding_amount = Decimal("0.00")
+            self.status = self.STATUS_CLOSED
+            self.save()
+            AuditLog.objects.create(user=by_user, action="loan_paid_off", details=f"Loan {self.id} paid off")
+        else:
+            self.save()
+            AuditLog.objects.create(user=by_user, action="loan_payment", details=f"{amount} towards {self.id}")
+        # create LoanPayment record
+        lp = LoanPayment.objects.create(loan=self, paid_at=timezone.now(), amount=amount, created_by=by_user)
+        return lp
+
+
+class LoanPayment(models.Model):
+    """Represents payments towards a loan."""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    loan = models.ForeignKey(Loan, related_name="payments", on_delete=models.CASCADE)
+    paid_at = models.DateTimeField(default=timezone.now)
+    amount = models.DecimalField(max_digits=MAX_DIGITS, decimal_places=DECIMAL_PLACES)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+
+    class Meta:
+        ordering = ["-paid_at"]
+
+
+# -------------------------
+# Notifications
+# -------------------------
+class Notification(models.Model):
+    """
+    Notification sent to user (email, push, in-app).
+    - channel: email/push/in-app
+    - status: pending/sent/failed/read
+    """
+    CHANNEL_EMAIL = "email"
+    CHANNEL_PUSH = "push"
+    CHANNEL_INAPP = "inapp"
+    CHANNEL_CHOICES = [
+        (CHANNEL_EMAIL, "Email"),
+        (CHANNEL_PUSH, "Push"),
+        (CHANNEL_INAPP, "In-App"),
+    ]
+
+    STATUS_PENDING = "pending"
+    STATUS_SENT = "sent"
+    STATUS_FAILED = "failed"
+    STATUS_READ = "read"
+    STATUS_CHOICES = [
+        (STATUS_PENDING, "Pending"),
+        (STATUS_SENT, "Sent"),
+        (STATUS_FAILED, "Failed"),
+        (STATUS_READ, "Read"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="notifications", on_delete=models.CASCADE)
+    channel = CharField(max_length=20, choices=CHANNEL_CHOICES, default=CHANNEL_INAPP)
+    subject = CharField(max_length=255, blank=True)
+    body = TextField(blank=True)
+    payload = JSONField(default=dict, blank=True)
+    status = CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
+    created_at = models.DateTimeField(default=timezone.now)
+    sent_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["user"]), models.Index(fields=["status"])]
+
+    def mark_sent(self):
+        self.status = self.STATUS_SENT
+        self.sent_at = timezone.now()
+        self.save()
+
+    def mark_read(self):
+        self.status = self.STATUS_READ
+        self.save()
+
+
+# -------------------------
+# EmployeeProfile
+# -------------------------
+class EmployeeProfile(models.Model):
+    """
+    Extra profile for bank employees (tellers, managers).
+    Stores employment metadata and optional permissions flags.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, related_name="employee_profile", on_delete=models.CASCADE)
+    employee_id = CharField(max_length=64, unique=True)
+    branch = CharField(max_length=128, blank=True)
+    job_title = CharField(max_length=128, blank=True)
+    is_privileged = BooleanField(default=False)  # override RBAC for special tasks
+    hired_at = DateField(null=True, blank=True)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["employee_id"]), models.Index(fields=["branch"])]
+
+
+# -------------------------
+# Device
+# -------------------------
+class Device(models.Model):
+    """
+    Track user devices/sessions (for device management, MFA, anomaly detection).
+    - device_id: opaque id generated by client
+    - last_seen: timestamp of last activity
+    - trusted: boolean if device was explicitly trusted
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="devices", on_delete=models.CASCADE)
+    device_id = CharField(max_length=256, db_index=True)
+    user_agent = CharField(max_length=512, blank=True)
+    ip_address = CharField(max_length=45, blank=True, null=True)
+    last_seen = models.DateTimeField(default=timezone.now)
+    trusted = BooleanField(default=False)
+    metadata = JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["user", "device_id"]), models.Index(fields=["trusted"])]
+
+
+# -------------------------
+# BackupJob
+# -------------------------
+class BackupJob(models.Model):
+    """
+    Tracking of backup/restore orchestrations.
+    - status: queued -> running -> success -> failed
+    - result: metadata about backup location
+    """
+    STATUS_QUEUED = "queued"
+    STATUS_RUNNING = "running"
+    STATUS_SUCCESS = "success"
+    STATUS_FAILED = "failed"
+    STATUS_CHOICES = [
+        (STATUS_QUEUED, "Queued"),
+        (STATUS_RUNNING, "Running"),
+        (STATUS_SUCCESS, "Success"),
+        (STATUS_FAILED, "Failed"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    initiated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    status = CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_QUEUED)
+    result = JSONField(default=dict, blank=True)  # e.g. {"path": "...", "size": 12345}
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+
+# -------------------------
+# AMLCheck
+# -------------------------
+class AMLCheck(models.Model):
+    """
+    AML / Screening record for a user or transaction. Integrate with external AML provider.
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    checked_object_type = CharField(max_length=64)  # "user" or "transaction" or other
+    checked_object_id = CharField(max_length=128)
+    provider = CharField(max_length=128, blank=True)
+    result = JSONField(default=dict, blank=True)
+    status = CharField(max_length=32, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [models.Index(fields=["checked_object_type", "checked_object_id"])]
