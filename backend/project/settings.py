@@ -68,6 +68,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    'banking.middleware.ImpersonationMiddleware',
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -193,3 +194,19 @@ CORS_ALLOWED_ORIGINS = env.list(
 # DEFAULT PRIMARY KEY
 # ────────────────────────────────
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+
+
+# Durée max d'une session d'impersonation en secondes (ex : 15 minutes)
+IMPERSONATION_MAX_SECONDS = 15 * 60
+
+# Liste des endpoints sensibles interdits en impersonation (prefixes ou noms)
+IMPERSONATION_BLOCKED_PATH_PREFIXES = [
+    "/admin/users/",            # modification d'utilisateurs
+    "/admin/roles/",            # gestion des rôles
+    "/employees/",              # endpoints RH sensibles
+    "/security/whitelist/",     # whitelist IP
+    "/security/whitelist/add/",
+    "/security/whitelist/remove/",
+    "/employees/*/set-role/",   # exemple, adapte selon tes routes
+    "/employees/*/reset-password/",
+]

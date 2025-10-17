@@ -651,3 +651,41 @@ class AMLCheck(models.Model):
 
     class Meta:
         indexes = [models.Index(fields=["checked_object_type", "checked_object_id"])]
+
+
+# -------------------------
+# ImpersonationLog (audit dédié pour les sessions d'impersonation)
+# -------------------------
+class ImpersonationLog(models.Model):
+    """
+    Journalise les sessions d'impersonation :
+    - impersonator : l'utilisateur qui a démarré l'impersonation
+    - target : l'utilisateur cible
+    - reason : raison donnée
+    - start_time / end_time : bornes temporelles
+    - start_ip / end_ip : IP de démarrage / fin
+    - start_user_agent / end_user_agent : user agent
+    - terminated_by : qui a arrêté l'impersonation (peut être l'impersonator ou système)
+    """
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    impersonator = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="impersonations_started", on_delete=models.SET_NULL, null=True)
+    target = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="impersonations_target", on_delete=models.SET_NULL, null=True)
+    reason = models.TextField(blank=True)
+    start_time = models.DateTimeField(default=timezone.now, db_index=True)
+    end_time = models.DateTimeField(null=True, blank=True, db_index=True)
+    start_ip = models.GenericIPAddressField(blank=True, null=True)
+    end_ip = models.GenericIPAddressField(blank=True, null=True)
+    start_user_agent = models.CharField(max_length=512, blank=True)
+    end_user_agent = models.CharField(max_length=512, blank=True)
+    terminated_by = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="impersonations_terminated", on_delete=models.SET_NULL, null=True, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-start_time"]
+        indexes = [
+            models.Index(fields=["impersonator"]),
+            models.Index(fields=["target"]),
+        ]
+
+    def __str__(self):
+        return f"Impersonation {self.id} {self.impersonator} -> {self.target} ({self.start_time.isoformat()})"

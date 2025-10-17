@@ -3,7 +3,7 @@ from .models import (
     CustomUser, BankAccount, Transaction,
     BankCard, AuditLog, Loan, LoanPayment,
     Notification, EmployeeProfile, Device,
-    BackupJob, AMLCheck
+    BackupJob, AMLCheck, ImpersonationLog
 )
 
 
@@ -91,3 +91,10 @@ class BackupJobAdmin(admin.ModelAdmin):
 class AMLCheckAdmin(admin.ModelAdmin):
     list_display = ("id", "checked_object_type", "checked_object_id", "provider", "status", "created_at")
     search_fields = ("checked_object_id",)
+
+
+@admin.register(ImpersonationLog)
+class ImpersonationLogAdmin(admin.ModelAdmin):
+    list_display = ("id", "impersonator", "target", "start_time", "end_time", "terminated_by")
+    search_fields = ("impersonator__email", "target__email", "reason")
+    readonly_fields = ("id", "start_time", "end_time", "start_ip", "end_ip", "start_user_agent", "end_user_agent", "terminated_by")

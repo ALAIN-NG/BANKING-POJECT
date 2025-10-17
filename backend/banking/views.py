@@ -42,7 +42,8 @@ from django.db import transaction
 from .models import (
     BankAccount, Transaction, BankCard,
     Loan, Notification, EmployeeProfile,
-    Device, BackupJob, AMLCheck, AuditLog
+    Device, BackupJob, AMLCheck, AuditLog,
+    ImpersonationLog
 )
 
 from .serializers import (
@@ -804,47 +805,61 @@ def list_roles(request: HttpRequest):
 
 
 # -------------------------
-# IMPERSONATION (connexion en tant qu'un autre utilisateur)
+# IMPERSONATION (production-ready)
 # -------------------------
-
 @login_required
 @user_passes_test(is_manager_or_admin)
 @require_POST
 def impersonate_user(request: HttpRequest, user_id: str):
     """
-    Permet à un administrateur ou manager de se connecter temporairement en tant qu'un autre utilisateur.
-    Fonction critique : toute action est auditée.
-    Corps JSON attendu : { "reason": "Support technique / test / vérification" }
-
-    ⚠️ En production, ce type d'action devrait :
-      - Exiger une double authentification (MFA),
-      - Avoir un timeout automatique (ex: 15 min),
-      - Être stockée en base pour traçabilité complète.
+    Débute une session d'impersonation.
+    - Nécessite 2FA validée dans la session (request.session['2fa_verified'] == True).
+    - Enregistre un ImpersonationLog avec start_time, IP, user-agent.
+    - Stocke l'id de l'impersonator dans la session pour restauration.
     """
+    # Exiger MFA
+    if not request.session.get("2fa_verified"):
+        return json_response({"error": "Validation 2FA requise avant impersonation"}, 403)
+
     data = parse_json(request)
-    reason = data.get("reason", "")
+    reason = data.get("reason", "").strip()
     if not reason or len(reason) < 5:
-        return json_response({"error": "Une raison détaillée est requise"}, 400)
+        return json_response({"error": "Une raison détaillée (>=5 caractères) est requise"}, 400)
 
     target_user = get_object_or_404(User, id=user_id)
+    # manager non-superuser ne peut pas impersonner d'autres managers/admins
     if target_user.role in (User.ROLE_ADMIN, User.ROLE_MANAGER) and not request.user.is_superuser:
-        # un manager ne peut pas se connecter en tant qu’un autre manager/admin
         raise PermissionDenied("Vous ne pouvez pas impersonner cet utilisateur")
 
-    # Stocker l'identité originale dans la session
+    # Informations sur l'initiateur
+    ip = request.META.get("REMOTE_ADDR")
+    ua = request.META.get("HTTP_USER_AGENT", "")[:512]
+
+    # Créer le log d'impersonation (start)
+    log = ImpersonationLog.objects.create(
+        impersonator=request.user,
+        target=target_user,
+        reason=reason,
+        start_time=timezone.now(),
+        start_ip=ip,
+        start_user_agent=ua,
+    )
+
+    # Stocker l'info dans la session
     request.session["impersonator_id"] = str(request.user.id)
     request.session["impersonator_email"] = request.user.email
     request.session["impersonation_reason"] = reason
-    request.session["impersonation_start"] = timezone.now().isoformat()
+    request.session["impersonation_start"] = log.start_time.isoformat()
+    request.session["impersonation_log_id"] = str(log.id)
 
-    # Remplacer la session actuelle par celle du user cible
+    # Effectuer le login (remplace la session courant)
     auth_login(request, target_user)
-    audit(request.user, "impersonate_start", f"Impersonation -> {target_user.email} raison={reason}")
 
+    audit(request.user, "impersonate_start", f"Impersonation -> {target_user.email} reason={reason}")
     return json_response({
         "message": f"Vous êtes maintenant connecté en tant que {target_user.email}",
         "target_user": str(target_user.id),
-        "reason": reason,
+        "impersonation_log_id": str(log.id),
     }, 200)
 
 
@@ -852,27 +867,49 @@ def impersonate_user(request: HttpRequest, user_id: str):
 @require_POST
 def stop_impersonation(request: HttpRequest):
     """
-    Termine une session d'impersonation active et restaure l'identité originale.
-    Si aucune impersonation active n’est détectée, renvoie une erreur.
+    Termine la session d'impersonation et restaure l'identité originale.
+    - Met à jour ImpersonationLog.end_time, end_ip, end_user_agent, terminated_by.
+    - Reconnecte l'impersonator.
     """
+    log_id = request.session.get("impersonation_log_id")
     impersonator_id = request.session.get("impersonator_id")
-    # impersonator_email = request.session.get("impersonator_email")
-
-    if not impersonator_id:
+    if not impersonator_id or not log_id:
         return json_response({"error": "Aucune session d'impersonation active"}, 400)
 
-    # Récupérer l’utilisateur original et le reconnecter
-    impersonator = get_object_or_404(User, id=impersonator_id)
+    # récupérer le log et le mettre à jour
+    try:
+        log = ImpersonationLog.objects.get(id=log_id)
+    except ImpersonationLog.DoesNotExist:
+        log = None
+
+    end_ip = request.META.get("REMOTE_ADDR")
+    end_ua = request.META.get("HTTP_USER_AGENT", "")[:512]
+    end_time = timezone.now()
+
+    if log:
+        log.end_time = end_time
+        log.end_ip = end_ip
+        log.end_user_agent = end_ua
+        try:
+            terminated_by = User.objects.get(id=impersonator_id)
+            log.terminated_by = terminated_by
+        except User.DoesNotExist:
+            log.terminated_by = None
+        log.save()
+
+    # restaurer l'utilisateur original
+    try:
+        impersonator = User.objects.get(id=impersonator_id)
+    except User.DoesNotExist:
+        return json_response({"error": "Utilisateur original introuvable"}, 500)
+
     auth_login(request, impersonator)
 
-    reason = request.session.get("impersonation_reason", "inconnue")
-    target_user_email = getattr(request.user, "email", None)
-    audit(impersonator, "impersonate_stop", f"Fin impersonation depuis {target_user_email} raison={reason}")
+    # nettoyer la session
+    for k in ("impersonator_id", "impersonator_email", "impersonation_reason", "impersonation_start", "impersonation_log_id"):
+        request.session.pop(k, None)
 
-    # Nettoyer les variables de session
-    for key in ["impersonator_id", "impersonator_email", "impersonation_reason", "impersonation_start"]:
-        request.session.pop(key, None)
-
+    audit(impersonator, "impersonate_stop", f"Fin impersonation, log_id={log_id}")
     return json_response({"message": "Impersonation terminée. Identité originale restaurée."}, 200)
 
 
@@ -880,18 +917,17 @@ def stop_impersonation(request: HttpRequest):
 @require_GET
 def impersonation_status(request: HttpRequest):
     """
-    Permet de vérifier si la session actuelle est en mode impersonation.
-    Retourne les métadonnées (qui, quand, raison).
+    Indique si la session courante est une impersonation et renvoie métadonnées.
     """
     if "impersonator_id" not in request.session:
         return json_response({"impersonating": False})
-
     return json_response({
         "impersonating": True,
         "impersonator_id": request.session.get("impersonator_id"),
         "impersonator_email": request.session.get("impersonator_email"),
         "reason": request.session.get("impersonation_reason"),
         "start_time": request.session.get("impersonation_start"),
+        "impersonation_log_id": request.session.get("impersonation_log_id"),
         "current_user": request.user.email,
     })
 

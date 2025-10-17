@@ -92,7 +92,7 @@ urlpatterns = [
     # -------------------------
     path("admin/audit/", views.audit_logs, name="audit_logs"),
     path("admin/system-logs/", views.system_logs, name="system_logs"),
-    path("admin/backup/", views.trigger_backup.as_view(), name="trigger_backup"),
+    # path("admin/backup/", views.trigger_backup.as_view(), name="trigger_backup"),
 
     # -------------------------
     # SÉCURITÉ AVANCÉE
