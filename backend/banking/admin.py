@@ -1,5 +1,10 @@
 from django.contrib import admin
-from .models import CustomUser, BankAccount, Transaction, BankCard, AuditLog
+from .models import (
+    CustomUser, BankAccount, Transaction,
+    BankCard, AuditLog, Loan, LoanPayment,
+    Notification, EmployeeProfile, Device,
+    BackupJob, AMLCheck
+)
 
 
 @admin.register(CustomUser)
@@ -44,3 +49,45 @@ class AuditLogAdmin(admin.ModelAdmin):
     list_filter = ("action",)
     search_fields = ("user__email", "action", "details")
     date_hierarchy = "timestamp"
+
+
+@admin.register(Loan)
+class LoanAdmin(admin.ModelAdmin):
+    list_display = ("id", "applicant", "amount", "status", "created_at")
+    list_filter = ("status",)
+    search_fields = ("applicant__email", "id")
+
+
+@admin.register(LoanPayment)
+class LoanPaymentAdmin(admin.ModelAdmin):
+    list_display = ("id", "loan", "amount", "paid_at")
+    search_fields = ("loan__id",)
+
+
+@admin.register(Notification)
+class NotificationAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "channel", "status", "created_at")
+    list_filter = ("channel", "status")
+    search_fields = ("user__email", "subject")
+
+
+@admin.register(EmployeeProfile)
+class EmployeeProfileAdmin(admin.ModelAdmin):
+    list_display = ("employee_id", "user", "branch", "job_title")
+
+
+@admin.register(Device)
+class DeviceAdmin(admin.ModelAdmin):
+    list_display = ("id", "user", "device_id", "last_seen", "trusted")
+    search_fields = ("device_id", "user__email")
+
+
+@admin.register(BackupJob)
+class BackupJobAdmin(admin.ModelAdmin):
+    list_display = ("id", "initiated_by", "status", "created_at")
+
+
+@admin.register(AMLCheck)
+class AMLCheckAdmin(admin.ModelAdmin):
+    list_display = ("id", "checked_object_type", "checked_object_id", "provider", "status", "created_at")
+    search_fields = ("checked_object_id",)

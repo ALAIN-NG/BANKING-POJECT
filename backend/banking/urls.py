@@ -55,41 +55,64 @@ urlpatterns = [
     # -------------------------
     # PRÊTS
     # -------------------------
-    path("loans/", views.list_loans, name="list_loans"),
-    path("loans/apply/", views.apply_loan, name="apply_loan"),
-    path("loans/<uuid:pk>/approve/", views.approve_loan, name="approve_loan"),
-    path("loans/<uuid:pk>/payment/", views.loan_payment, name="loan_payment"),
+    path("loans/", views.LoanListCreateView.as_view(), name="loan-list-create"),
+    path("loans/<uuid:pk>/approve/", views.LoanApproveView.as_view(), name="loan-approve"),
+    path("loans/<uuid:pk>/payment/", views.LoanPaymentView.as_view(), name="loan-payment"),
 
     # -------------------------
-    # NOTIFICATIONS / SUPPORT
+    # NOTIFICATIONS
     # -------------------------
-    path("notifications/", views.list_notifications, name="list_notifications"),
-    path("notifications/send/", views.send_notification, name="send_notification"),
-    path("notifications/<uuid:pk>/read/", views.mark_notification_read, name="mark_notification_read"),
+    path("notifications/", views.NotificationListView.as_view(), name="notification-list"),
+    path("notifications/<uuid:pk>/read/", views.NotificationReadView.as_view(), name="notification-read"),
 
     # -------------------------
-    # RAPPORTS / AML
+    # RAPPORTS / AML / Fraud / Risk
     # -------------------------
     path("reports/financial/", views.financial_report, name="financial_report"),
     path("reports/aml-check/", views.aml_check, name="aml_check"),
+    path("reports/fraud-detection/", views.fraud_detection_report, name="fraud_detection_report"),
+    path("reports/risk-assessment/", views.risk_assessment_report, name="risk_assessment_report"),
 
     # -------------------------
     # EMPLOYÉS / ADMIN
     # -------------------------
-    path("employees/", views.list_employees, name="list_employees"),
+    path("employees/", views.list_employees_detailed, name="list_employees_detailed"),
     path("employees/create/", views.create_employee, name="create_employee"),
     path("admin/users/<uuid:user_id>/toggle/", views.toggle_user_active, name="toggle_user_active"),
+    path("employees/<uuid:user_id>/", views.get_employee_detail, name="get_employee_detail"),
+    path("employees/<uuid:user_id>/update-profile/", views.update_employee_profile, name="update_employee_profile"),
+    path("employees/<uuid:user_id>/set-role/", views.set_user_role, name="set_user_role"),
+    path("employees/<uuid:user_id>/reset-password/", views.reset_user_password, name="reset_user_password"),
+    path("employees/<uuid:user_id>/force-logout/", views.force_logout_user, name="force_logout_user"),
+    path("employees/<uuid:user_id>/audit/", views.get_employee_audit, name="get_employee_audit"),
+    path("roles/", views.list_roles, name="list_roles"),
 
     # -------------------------
     # JOURNAUX / AUDIT / BACKUP
     # -------------------------
     path("admin/audit/", views.audit_logs, name="audit_logs"),
     path("admin/system-logs/", views.system_logs, name="system_logs"),
-    path("admin/backup/", views.trigger_backup, name="trigger_backup"),
+    path("admin/backup/", views.trigger_backup.as_view(), name="trigger_backup"),
 
     # -------------------------
     # SÉCURITÉ AVANCÉE
     # -------------------------
     path("security/blocked-ips/", views.blocked_ips, name="blocked_ips"),
     path("security/bruteforce/", views.brute_force_status, name="brute_force_status"),
+    path("security/2fa/enable/", views.enable_2fa, name="enable_2fa"),
+    path("security/2fa/verify/", views.verify_2fa, name="verify_2fa"),
+    path("security/whitelist/", views.get_allowed_ips, name="get_allowed_ips"),
+    path("security/whitelist/add/", views.add_allowed_ip, name="add_allowed_ip"),
+    path("security/whitelist/remove/", views.remove_allowed_ip, name="remove_allowed_ip"),
+    path("security/sessions/", views.list_active_sessions, name="list_active_sessions"),
+    path("security/audit/export/", views.export_audit_logs_csv, name="export_audit_logs_csv"),
+
+    # --------------------------
+    # IMPERSONATION
+    # --------------------------
+    path("employees/<uuid:user_id>/impersonate/", views.impersonate_user, name="impersonate_user"),
+    path("employees/impersonation/stop/", views.stop_impersonation, name="stop_impersonation"),
+    path("employees/impersonation/status/", views.impersonation_status, name="impersonation_status"),
+
+
 ]

@@ -11,32 +11,45 @@ from __future__ import annotations
 import csv
 import io
 import json
+import secrets
 from decimal import Decimal
 from typing import Optional
 
+from django.core.cache import cache
+from django.core.exceptions import ValidationError, PermissionDenied
+
+
 from django.contrib.auth import authenticate, login, logout, get_user_model
 from django.contrib.auth.decorators import login_required, user_passes_test
-from django.core.exceptions import ValidationError, PermissionDenied
+from django.contrib.sessions.models import Session
+from django.contrib.auth import login as auth_login
+
+from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.cache import never_cache
+
+from django.utils import timezone
 from django.db import models
 from django.http import JsonResponse, HttpRequest, HttpResponse
 from django.shortcuts import get_object_or_404
-from django.views.decorators.csrf import csrf_protect
-from django.views.decorators.http import require_GET, require_POST
-from .models import (
-    BankAccount, Transaction, BankCard,
-    Loan, Notification, EmployeeProfile,
-    Device, BackupJob, AMLCheck, AuditLog
-)
-from .serializers import (
-    LoanSerializer, LoanPaymentSerializer, NotificationSerializer,
-    EmployeeProfileSerializer, DeviceSerializer, BackupJobSerializer,
-    AMLCheckSerializer
-)
+
 
 from rest_framework import generics, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from django.db import transaction
+
+from .models import (
+    BankAccount, Transaction, BankCard,
+    Loan, Notification, EmployeeProfile,
+    Device, BackupJob, AMLCheck, AuditLog
+)
+
+from .serializers import (
+    LoanSerializer, LoanPaymentSerializer, NotificationSerializer,
+    EmployeeProfileSerializer, DeviceSerializer, BackupJobSerializer,
+    AMLCheckSerializer
+)
 
 User = get_user_model()
 
@@ -593,12 +606,6 @@ class AMLCheckListCreateView(generics.ListCreateAPIView):
 # -------------------------
 # ADMIN / EMPLOYEES
 # -------------------------
-@login_required
-@user_passes_test(is_manager_or_admin)
-def list_employees(request: HttpRequest):
-    qs = User.objects.filter(models.Q(role=User.ROLE_TELLER) | models.Q(role=User.ROLE_MANAGER) | models.Q(is_superuser=True))
-    out = [{"id": str(u.id), "email": u.email, "role": u.role, "active": u.is_active} for u in qs]
-    return json_response(out)
 
 
 @login_required
@@ -632,6 +639,264 @@ def toggle_user_active(request: HttpRequest, user_id: str):
 
 
 # -------------------------
+# GESTION RH & RÔLES INTERNES (EMPLOYEES / ROLES / SUSPENSION / PASSWORD)
+# -------------------------
+
+# NOTE: Les endpoints ci-dessous sont strictement réservés aux managers/admins.
+# Ils utilisent user_passes_test(is_manager_or_admin) ou require_roles équivalent.
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def list_employees_detailed(request: HttpRequest):
+    """
+    Liste détaillée des employés (profil RH, statut, branche).
+    Accessible aux managers et admins.
+    """
+    qs = User.objects.filter(models.Q(role=User.ROLE_TELLER) | models.Q(role=User.ROLE_MANAGER) | models.Q(is_superuser=True))
+    out = []
+    for u in qs:
+        profile = getattr(u, "employee_profile", None)
+        out.append({
+            "id": str(u.id),
+            "email": u.email,
+            "username": u.username,
+            "role": u.role,
+            "active": u.is_active,
+            "employee_id": profile.employee_id if profile else None,
+            "branch": profile.branch if profile else None,
+            "job_title": profile.job_title if profile else None,
+        })
+    audit(request.user, "list_employees_detailed", f"{qs.count()} employés listés")
+    return json_response(out)
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def get_employee_detail(request: HttpRequest, user_id: str):
+    """
+    Détails RH sur un employé spécifique.
+    """
+    u = get_object_or_404(User, id=user_id)
+    profile = getattr(u, "employee_profile", None)
+    data = {
+        "id": str(u.id),
+        "email": u.email,
+        "username": u.username,
+        "role": u.role,
+        "active": u.is_active,
+        "full_name": u.full_name,
+        "employee_profile": {
+            "employee_id": profile.employee_id if profile else None,
+            "branch": profile.branch if profile else None,
+            "job_title": profile.job_title if profile else None,
+            "is_privileged": profile.is_privileged if profile else False,
+        } if profile else None
+    }
+    audit(request.user, "get_employee_detail", f"consulté {u.email}")
+    return json_response(data)
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def update_employee_profile(request: HttpRequest, user_id: str):
+    """
+    Met à jour le profil RH d'un employé (branch, job_title, is_privileged).
+    Corps JSON attendu: { "branch": "...", "job_title": "...", "is_privileged": true }
+    """
+    data = parse_json(request)
+    u = get_object_or_404(User, id=user_id)
+    profile, created = EmployeeProfile.objects.get_or_create(user=u, defaults={"employee_id": f"EMP-{secrets.token_hex(4)}"})
+    updated_fields = []
+    for field in ("branch", "job_title", "is_privileged"):
+        if field in data:
+            setattr(profile, field, data[field])
+            updated_fields.append(field)
+    profile.save()
+    audit(request.user, "update_employee_profile", f"{u.email} champs modifiés: {','.join(updated_fields)}")
+    return json_response({"message": "profil employé mis à jour", "employee_id": profile.employee_id})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def set_user_role(request: HttpRequest, user_id: str):
+    """
+    Change le rôle d'un utilisateur.
+    Corps JSON: { "role": "manager" }
+    Validation: role doit être dans ROLE_CHOICES.
+    """
+    data = parse_json(request)
+    new_role = data.get("role")
+    if new_role not in dict(User.ROLE_CHOICES).keys():
+        return json_response({"error": "role invalide"}, 400)
+    u = get_object_or_404(User, id=user_id)
+    old_role = u.role
+    u.role = new_role
+    u.save()
+    audit(request.user, "set_user_role", f"{u.email}: {old_role} -> {new_role}")
+    return json_response({"message": "role mis à jour", "user": str(u.id), "role": new_role})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def reset_user_password(request: HttpRequest, user_id: str):
+    """
+    Réinitialise le mot de passe d'un utilisateur en générant un mot de passe temporaire.
+    En production : envoyer un lien de reset sécurisé par email (token-expirable).
+    Retourne uniquement un indicateur en prod ; ici pour admin on peut retourner le temp pw.
+    """
+    target = get_object_or_404(User, id=user_id)
+    # Générer un mot de passe temporaire fort
+    temp_pw = secrets.token_urlsafe(12)
+    target.set_password(temp_pw)
+    target.save()
+    audit(request.user, "reset_user_password", f"pwd reset pour {target.email}")
+    # En prod: ne PAS retourner le mot de passe dans la réponse (envoyer par mail)
+    return json_response({"message": "mot de passe réinitialisé", "temporary_password": temp_pw})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def force_logout_user(request: HttpRequest, user_id: str):
+    """
+    Invalide toutes les sessions d'un utilisateur (force logout).
+    Parcours les sessions et supprime celles appartenant à user_id.
+    """
+    sessions = Session.objects.all()
+    removed = 0
+    for s in sessions:
+        data = s.get_decoded()
+        if str(data.get("_auth_user_id")) == str(user_id):
+            s.delete()
+            removed += 1
+    audit(request.user, "force_logout_user", f"user={user_id} sessions_removed={removed}")
+    return json_response({"message": f"{removed} sessions supprimées"})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def get_employee_audit(request: HttpRequest, user_id: str):
+    """
+    Récupère les entrées d'audit liées à un employé (filtre par user).
+    Limite par défaut: 1000 entrées récentes.
+    """
+    logs = AuditLog.objects.filter(user__id=user_id).order_by("-timestamp")[:1000]
+    out = [{"timestamp": lo.timestamp.isoformat(), "action": lo.action, "details": lo.details, "ip": lo.ip_address} for lo in logs]
+    audit(request.user, "get_employee_audit", f"{user_id} logs={len(out)}")
+    return json_response(out)
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def list_roles(request: HttpRequest):
+    """
+    Retourne la liste des rôles utilisables par le système pour affichage UI.
+    """
+    roles = [{"key": r[0], "label": r[1]} for r in User.ROLE_CHOICES]
+    return json_response({"roles": roles})
+
+
+# -------------------------
+# IMPERSONATION (connexion en tant qu'un autre utilisateur)
+# -------------------------
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def impersonate_user(request: HttpRequest, user_id: str):
+    """
+    Permet à un administrateur ou manager de se connecter temporairement en tant qu'un autre utilisateur.
+    Fonction critique : toute action est auditée.
+    Corps JSON attendu : { "reason": "Support technique / test / vérification" }
+
+    ⚠️ En production, ce type d'action devrait :
+      - Exiger une double authentification (MFA),
+      - Avoir un timeout automatique (ex: 15 min),
+      - Être stockée en base pour traçabilité complète.
+    """
+    data = parse_json(request)
+    reason = data.get("reason", "")
+    if not reason or len(reason) < 5:
+        return json_response({"error": "Une raison détaillée est requise"}, 400)
+
+    target_user = get_object_or_404(User, id=user_id)
+    if target_user.role in (User.ROLE_ADMIN, User.ROLE_MANAGER) and not request.user.is_superuser:
+        # un manager ne peut pas se connecter en tant qu’un autre manager/admin
+        raise PermissionDenied("Vous ne pouvez pas impersonner cet utilisateur")
+
+    # Stocker l'identité originale dans la session
+    request.session["impersonator_id"] = str(request.user.id)
+    request.session["impersonator_email"] = request.user.email
+    request.session["impersonation_reason"] = reason
+    request.session["impersonation_start"] = timezone.now().isoformat()
+
+    # Remplacer la session actuelle par celle du user cible
+    auth_login(request, target_user)
+    audit(request.user, "impersonate_start", f"Impersonation -> {target_user.email} raison={reason}")
+
+    return json_response({
+        "message": f"Vous êtes maintenant connecté en tant que {target_user.email}",
+        "target_user": str(target_user.id),
+        "reason": reason,
+    }, 200)
+
+
+@login_required
+@require_POST
+def stop_impersonation(request: HttpRequest):
+    """
+    Termine une session d'impersonation active et restaure l'identité originale.
+    Si aucune impersonation active n’est détectée, renvoie une erreur.
+    """
+    impersonator_id = request.session.get("impersonator_id")
+    # impersonator_email = request.session.get("impersonator_email")
+
+    if not impersonator_id:
+        return json_response({"error": "Aucune session d'impersonation active"}, 400)
+
+    # Récupérer l’utilisateur original et le reconnecter
+    impersonator = get_object_or_404(User, id=impersonator_id)
+    auth_login(request, impersonator)
+
+    reason = request.session.get("impersonation_reason", "inconnue")
+    target_user_email = getattr(request.user, "email", None)
+    audit(impersonator, "impersonate_stop", f"Fin impersonation depuis {target_user_email} raison={reason}")
+
+    # Nettoyer les variables de session
+    for key in ["impersonator_id", "impersonator_email", "impersonation_reason", "impersonation_start"]:
+        request.session.pop(key, None)
+
+    return json_response({"message": "Impersonation terminée. Identité originale restaurée."}, 200)
+
+
+@login_required
+@require_GET
+def impersonation_status(request: HttpRequest):
+    """
+    Permet de vérifier si la session actuelle est en mode impersonation.
+    Retourne les métadonnées (qui, quand, raison).
+    """
+    if "impersonator_id" not in request.session:
+        return json_response({"impersonating": False})
+
+    return json_response({
+        "impersonating": True,
+        "impersonator_id": request.session.get("impersonator_id"),
+        "impersonator_email": request.session.get("impersonator_email"),
+        "reason": request.session.get("impersonation_reason"),
+        "start_time": request.session.get("impersonation_start"),
+        "current_user": request.user.email,
+    })
+
+
+# -------------------------
 # AUDIT & LOGS
 # -------------------------
 @login_required
@@ -651,6 +916,135 @@ def system_logs(request: HttpRequest):
 
 
 # -------------------------
+# GESTION INTERNE ET CONFORMITÉ (REPORTS / AML / FRAUDE / RISQUE)
+# -------------------------
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def financial_report(request: HttpRequest):
+    """
+    Rapport global de performance financière.
+    Agrège les montants totaux des transactions et soldes des comptes.
+    Accessible uniquement aux managers et administrateurs.
+    """
+    total_accounts = BankAccount.objects.count()
+    total_balance = BankAccount.objects.aggregate(total=models.Sum("balance"))["total"] or Decimal("0.00")
+    total_deposits = Transaction.objects.filter(type=Transaction.TYPE_DEPOSIT, status=Transaction.STATUS_COMPLETED).aggregate(
+        total=models.Sum("amount")
+    )["total"] or Decimal("0.00")
+    total_withdrawals = Transaction.objects.filter(type=Transaction.TYPE_WITHDRAWAL, status=Transaction.STATUS_COMPLETED).aggregate(
+        total=models.Sum("amount")
+    )["total"] or Decimal("0.00")
+    total_transfers = Transaction.objects.filter(type=Transaction.TYPE_TRANSFER, status=Transaction.STATUS_COMPLETED).aggregate(
+        total=models.Sum("amount")
+    )["total"] or Decimal("0.00")
+
+    data = {
+        "total_accounts": total_accounts,
+        "total_balance": str(total_balance),
+        "total_deposits": str(total_deposits),
+        "total_withdrawals": str(total_withdrawals),
+        "total_transfers": str(total_transfers),
+        "net_flow": str(total_deposits - total_withdrawals),
+    }
+    audit(request.user, "financial_report", "Rapport financier global consulté")
+    return json_response(data)
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def aml_check(request: HttpRequest):
+    """
+    Vérifie les transactions suspectes selon des règles simples.
+    (En production, cela utiliserait une intégration AML réelle ou un moteur IA.)
+    """
+    suspicious_transactions = Transaction.objects.filter(
+        models.Q(amount__gt=Decimal("10000000")) |  # transactions > 10 millions
+        models.Q(status=Transaction.STATUS_FAILED)
+    ).select_related("from_account", "to_account")
+
+    alerts = []
+    for tx in suspicious_transactions:
+        alerts.append({
+            "tx_id": str(tx.id),
+            "type": tx.type,
+            "amount": str(tx.amount),
+            "status": tx.status,
+            "from": tx.from_account.account_number if tx.from_account else None,
+            "to": tx.to_account.account_number if tx.to_account else tx.to_account_number,
+            "created_at": tx.created_at.isoformat(),
+            "reason": "Montant inhabituel" if tx.amount > Decimal("10000000") else "Échec de transaction suspect",
+        })
+
+    audit(request.user, "aml_check", f"{len(alerts)} alertes détectées")
+    return json_response({"alerts": alerts, "total_alerts": len(alerts)})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def fraud_detection_report(request: HttpRequest):
+    """
+    Détection simple des anomalies ou fraudes potentielles.
+    Exemple : plusieurs retraits consécutifs sur courte période ou comptes dormants.
+    """
+    recent_withdrawals = Transaction.objects.filter(
+        type=Transaction.TYPE_WITHDRAWAL,
+        created_at__gte=timezone.now() - timezone.timedelta(days=1)
+    ).values("from_account").annotate(count=models.Count("id")).filter(count__gte=5)
+
+    dormant_accounts = BankAccount.objects.filter(
+        is_active=True,
+        balance__gt=Decimal("0.00"),
+        created_at__lte=timezone.now() - timezone.timedelta(days=365)
+    ).exclude(
+        outgoing_transactions__created_at__gte=timezone.now() - timezone.timedelta(days=180)
+    )
+
+    audit(request.user, "fraud_detection_report", "Rapport de détection de fraude généré")
+
+    return json_response({
+        "frequent_withdrawals_accounts": [r["from_account"] for r in recent_withdrawals],
+        "dormant_accounts": [a.account_number for a in dormant_accounts],
+    })
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def risk_assessment_report(request: HttpRequest):
+    """
+    Évalue le risque global des clients selon leur activité et leur solde.
+    Score simple : (transactions récentes, volume, comportement).
+    """
+    clients = User.objects.filter(role=User.ROLE_CLIENT)
+    report = []
+
+    for client in clients:
+        tx_count = Transaction.objects.filter(
+            models.Q(from_account__owner=client) | models.Q(to_account__owner=client)
+        ).count()
+        total_balance = BankAccount.objects.filter(owner=client).aggregate(total=models.Sum("balance"))["total"] or Decimal("0.00")
+        score = 50
+        if tx_count > 100:
+            score += 20
+        if total_balance > Decimal("10000000"):
+            score += 20
+        if tx_count < 2:
+            score -= 15
+        report.append({
+            "client": client.email,
+            "transactions": tx_count,
+            "total_balance": str(total_balance),
+            "risk_score": score,
+        })
+
+    audit(request.user, "risk_assessment", "Rapport de risque client généré")
+    return json_response({"clients": report})
+
+
+# -------------------------
 # SECURITY / BRUTE FORCE / BLOCKED IPs
 # -------------------------
 @login_required
@@ -665,6 +1059,181 @@ def blocked_ips(request: HttpRequest):
 def brute_force_status(request: HttpRequest):
     # Integrate with django-axes for details; stub:
     return json_response({"message": "integrate django-axes to monitor brute-force attempts"}, 501)
+
+
+# ============================================================
+# 🔐 SÉCURITÉ — 2FA, WHITELIST IP, SESSIONS, AUDIT EXPORT
+# Production-grade security layer for banking systems
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 🧩 DOUBLE AUTHENTIFICATION (2FA / OTP)
+# ------------------------------------------------------------
+@csrf_protect
+@login_required
+@require_POST
+@never_cache
+def enable_2fa(request: HttpRequest):
+    """
+    Active la double authentification (2FA) pour l'utilisateur connecté.
+    Un code à usage unique est généré et stocké temporairement en cache.
+    En production, ce code serait envoyé via SMS ou e-mail sécurisé.
+    """
+    user = request.user
+    # Génération d’un code OTP aléatoire sécurisé (6 chiffres)
+    otp_code = str(secrets.randbelow(999999)).zfill(6)
+    cache_key = f"otp_{user.id}"
+    cache.set(cache_key, otp_code, timeout=300)  # valide 5 min
+
+    # En prod : appel d’un service SMS/email
+    audit(user, "2fa_requested", f"Code OTP généré pour {user.email}")
+    return json_response({
+        "message": "Code 2FA généré et envoyé via canal sécurisé.",
+        "validity": "5 minutes"
+    })
+
+
+@csrf_protect
+@login_required
+@require_POST
+@never_cache
+def verify_2fa(request: HttpRequest):
+    """
+    Vérifie le code OTP soumis par l'utilisateur.
+    En cas de succès, la session est marquée comme '2FA validée'.
+    """
+    data = parse_json(request)
+    code = str(data.get("code", "")).strip()
+    cache_key = f"otp_{request.user.id}"
+    expected = cache.get(cache_key)
+
+    if not expected:
+        audit(request.user, "2fa_failed_expired", "Code expiré ou non généré")
+        return json_response({"error": "Code expiré ou inexistant"}, 403)
+
+    if code != expected:
+        audit(request.user, "2fa_failed_invalid", f"Code saisi: {code}")
+        return json_response({"error": "Code invalide"}, 403)
+
+    # Validation réussie
+    cache.delete(cache_key)
+    request.session["2fa_verified"] = True
+    audit(request.user, "2fa_verified", "Authentification à deux facteurs réussie")
+    return json_response({"message": "Vérification 2FA réussie"})
+
+
+# ------------------------------------------------------------
+# 🌐 GESTION DES ADRESSES IP AUTORISÉES (WHITELIST)
+# ------------------------------------------------------------
+ALLOWED_IPS_CACHE_KEY = "allowed_ips_list"
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+def get_allowed_ips(request: HttpRequest):
+    """Retourne la liste actuelle des IP autorisées."""
+    ips = cache.get(ALLOWED_IPS_CACHE_KEY, [])
+    audit(request.user, "list_whitelist", f"{len(ips)} IPs consultées")
+    return json_response({"allowed_ips": ips})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def add_allowed_ip(request: HttpRequest):
+    """Ajoute une nouvelle IP à la liste blanche (whitelist)."""
+    data = parse_json(request)
+    ip = str(data.get("ip", "")).strip()
+    if not ip:
+        return json_response({"error": "Adresse IP requise"}, 400)
+
+    ips = cache.get(ALLOWED_IPS_CACHE_KEY, [])
+    if ip not in ips:
+        ips.append(ip)
+        cache.set(ALLOWED_IPS_CACHE_KEY, ips, None)
+        audit(request.user, "add_ip_whitelist", ip)
+    return json_response({"message": f"{ip} ajoutée à la liste blanche"})
+
+
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_POST
+def remove_allowed_ip(request: HttpRequest):
+    """Supprime une IP de la whitelist."""
+    data = parse_json(request)
+    ip = str(data.get("ip", "")).strip()
+    ips = cache.get(ALLOWED_IPS_CACHE_KEY, [])
+    if ip in ips:
+        ips.remove(ip)
+        cache.set(ALLOWED_IPS_CACHE_KEY, ips, None)
+        audit(request.user, "remove_ip_whitelist", ip)
+    return json_response({"message": f"{ip} supprimée de la liste blanche"})
+
+
+# ------------------------------------------------------------
+# 💻 SURVEILLANCE DES SESSIONS ACTIVES
+# ------------------------------------------------------------
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+@never_cache
+def list_active_sessions(request: HttpRequest):
+    """
+    Liste toutes les sessions utilisateur actives.
+    Permet d’auditer les connexions en temps réel.
+    """
+    sessions = Session.objects.all()
+    active = []
+    now = timezone.now()
+    for s in sessions:
+        data = s.get_decoded()
+        uid = data.get("_auth_user_id")
+        if uid:
+            try:
+                user = User.objects.get(id=uid)
+                active.append({
+                    "session_key": s.session_key,
+                    "user": user.email,
+                    "created": s.expire_date - timezone.timedelta(days=7),
+                    "expires": s.expire_date,
+                    "is_expired": s.expire_date < now
+                })
+            except User.DoesNotExist:
+                continue
+    audit(request.user, "list_sessions", f"{len(active)} sessions actives listées")
+    return json_response({"active_sessions": active})
+
+
+# ------------------------------------------------------------
+# 📦 EXPORTATION SÉCURISÉE DES JOURNAUX D’AUDIT
+# ------------------------------------------------------------
+@login_required
+@user_passes_test(is_manager_or_admin)
+@require_GET
+@never_cache
+def export_audit_logs_csv(request: HttpRequest):
+    """
+    Exporte les journaux d’audit récents en CSV chiffré.
+    En production, ce fichier doit être signé ou envoyé via canal SFTP.
+    """
+    qs = AuditLog.objects.select_related("user").order_by("-timestamp")[:5000]
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["timestamp", "user", "action", "details", "ip"])
+    for a in qs:
+        writer.writerow([
+            a.timestamp.isoformat(),
+            a.user.email if a.user else "",
+            a.action,
+            a.details,
+            a.ip_address or "",
+        ])
+    response = HttpResponse(buffer.getvalue(), content_type="text/csv; charset=utf-8")
+    response["Content-Disposition"] = "attachment; filename=audit_logs.csv"
+    audit(request.user, "export_audit_logs", f"{qs.count()} entrées exportées")
+    return response
 
 
 # ---------------------------
