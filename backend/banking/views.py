@@ -1,4 +1,3 @@
-# backend/banking/views.py
 """
 API endpoints "entreprise" pour l'application bancaire.
 Sécurisé : CSRF, session auth, role checks, validations, audit logging, atomic ops.

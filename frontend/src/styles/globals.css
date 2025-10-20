@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Styles globaux personnalisés */
+body {
+  background-color: rgb(77, 102, 127);
+  color: rgb(17 24 39);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+  color: rgb(37 99 235);
+  transition: color 0.2s ease-in-out;
+}
+
+a:hover {
+  color: rgb(30 64 175);
+}
